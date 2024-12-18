@@ -23,11 +23,7 @@ const Logger = {
 };
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildPresences,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
 const DRY_RUN = process.env.DRY_RUN === "true";
