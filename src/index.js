@@ -272,58 +272,108 @@ function setupRoleSync(client) {
   if (DRY_RUN) Logger.info("Running in DRY RUN mode");
 
   client.on("guildMemberUpdate", async (oldMember, newMember) => {
-    if (newMember.guild.id !== MAIN_SERVER_ID) return;
+    // Determine if this is main or slave server
+    const isMainServer = newMember.guild.id === MAIN_SERVER_ID;
 
-    // Handle guild role changes
-    const addedGuildRoles = newMember.roles.cache.filter(
-      (role) => !oldMember.roles.cache.has(role.id) && ROLE_PAIRS[role.id]
-    );
-
-    const removedGuildRoles = oldMember.roles.cache.filter(
-      (role) => !newMember.roles.cache.has(role.id) && ROLE_PAIRS[role.id]
-    );
-
-    // Handle member role removal
-    const memberRoleRemoved =
-      oldMember.roles.cache.has(MAIN_MEMBER_ROLE_ID) &&
-      !newMember.roles.cache.has(MAIN_MEMBER_ROLE_ID);
-
-    // Handle pending role addition
-    const pendingRoleAdded =
-      !oldMember.roles.cache.has(PENDING_ROLE_ID) &&
-      newMember.roles.cache.has(PENDING_ROLE_ID);
-
-    // Process role changes
-    if (addedGuildRoles.size > 0) {
-      for (const [_, role] of addedGuildRoles) {
-        await retryOperation(() => syncRoleAdd(client, newMember, role.id));
-      }
-    }
-
-    if (removedGuildRoles.size > 0) {
-      for (const [_, role] of removedGuildRoles) {
-        await retryOperation(() => syncRoleRemove(client, newMember, role.id));
-      }
-    }
-
-    // Re-add member role if removed while having guild role
-    if (memberRoleRemoved && (await hasGuildRole(newMember))) {
-      await safeRoleOperation(
-        newMember,
-        MAIN_MEMBER_ROLE_ID,
-        "add",
-        "Restored main member role to"
+    if (isMainServer) {
+      // Handle main server role changes
+      const addedGuildRoles = newMember.roles.cache.filter(
+        (role) => !oldMember.roles.cache.has(role.id) && ROLE_PAIRS[role.id]
       );
-    }
 
-    // Remove pending role if user has guild role
-    if (pendingRoleAdded && (await hasGuildRole(newMember))) {
-      await safeRoleOperation(
-        newMember,
-        PENDING_ROLE_ID,
-        "remove",
-        "Removed pending role from"
+      const removedGuildRoles = oldMember.roles.cache.filter(
+        (role) => !newMember.roles.cache.has(role.id) && ROLE_PAIRS[role.id]
       );
+
+      const memberRoleRemoved =
+        oldMember.roles.cache.has(MAIN_MEMBER_ROLE_ID) &&
+        !newMember.roles.cache.has(MAIN_MEMBER_ROLE_ID);
+
+      const pendingRoleAdded =
+        !oldMember.roles.cache.has(PENDING_ROLE_ID) &&
+        newMember.roles.cache.has(PENDING_ROLE_ID);
+
+      // Process role changes
+      if (addedGuildRoles.size > 0) {
+        for (const [_, role] of addedGuildRoles) {
+          await retryOperation(() => syncRoleAdd(client, newMember, role.id));
+        }
+      }
+
+      if (removedGuildRoles.size > 0) {
+        for (const [_, role] of removedGuildRoles) {
+          await retryOperation(() =>
+            syncRoleRemove(client, newMember, role.id)
+          );
+        }
+      }
+
+      if (memberRoleRemoved && (await hasGuildRole(newMember))) {
+        await safeRoleOperation(
+          newMember,
+          MAIN_MEMBER_ROLE_ID,
+          "add",
+          "Restored main member role to"
+        );
+      }
+
+      if (pendingRoleAdded && (await hasGuildRole(newMember))) {
+        await safeRoleOperation(
+          newMember,
+          PENDING_ROLE_ID,
+          "remove",
+          "Removed pending role from"
+        );
+      }
+    } else {
+      // Handle slave server role changes
+      const slaveServerId = newMember.guild.id;
+
+      // Find all main roles that map to this slave server
+      const mainRoleConfigs = Object.entries(ROLE_PAIRS).filter(
+        ([_, servers]) => Object.keys(servers).includes(slaveServerId)
+      );
+
+      if (mainRoleConfigs.length === 0) return;
+
+      const mainGuild = await client.guilds.fetch(MAIN_SERVER_ID);
+      const mainMember = await mainGuild.members
+        .fetch(newMember.id)
+        .catch(() => null);
+      if (!mainMember) return;
+
+      // Process each main role mapping
+      for (const [mainRoleId, slaveServers] of mainRoleConfigs) {
+        const slaveRoleId = slaveServers[slaveServerId];
+        const hadRole = oldMember.roles.cache.has(slaveRoleId);
+        const hasRole = newMember.roles.cache.has(slaveRoleId);
+
+        if (hadRole === hasRole) continue;
+
+        if (!mainMember.roles.cache.has(mainRoleId) && hasRole) {
+          Logger.warn(
+            `Unauthorized role addition detected in ${newMember.guild.name}`
+          );
+          if (!DRY_RUN) {
+            await newMember.roles.remove(slaveRoleId);
+            Logger.role(
+              `Removed unauthorized role from ${newMember.user.username}`
+            );
+          }
+        }
+
+        if (mainMember.roles.cache.has(mainRoleId) && !hasRole) {
+          Logger.warn(
+            `Unauthorized role removal detected in ${newMember.guild.name}`
+          );
+          if (!DRY_RUN) {
+            await newMember.roles.add(slaveRoleId);
+            Logger.role(
+              `Restored authorized role to ${newMember.user.username}`
+            );
+          }
+        }
+      }
     }
   });
 
