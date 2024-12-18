@@ -44,18 +44,26 @@ const GUILD_ROLES = {
 };
 
 const ROLE_PAIRS = {
+  // Main server role ID -> Slave server role IDs
   "1315072149173698580": {
-    "1295522487349674095": "1315855506966839296",
+    // Tsunami role on main
+    "1295522487349674095": "1315855506966839296", // micros server : tsunami role
+    "1301569908152471675": "1319063260481454120", // avalanche server : alliance t role
   },
   "1315071746721976363": {
-    "1295522487349674095": "1302381052253175828",
+    // Hurricane role on main
+    "1295522487349674095": "1302381052253175828", // micros server : hurricane role
+    "1301569908152471675": "1319067741373857883", // avalanche server : alliance hu role
   },
   "1314816353797935214": {
-    "1301569908152471675": "1309371684536717394",
-    "1295522487349674095": "1302376038633832499",
+    // Avalanche role on main
+    "1301569908152471675": "1309371684536717394", // avalanche server : avalanche role
+    "1295522487349674095": "1302376038633832499", // micros server : avalanche role
   },
   "1315072176839327846": {
-    "1295522487349674095": "1302372881317105684",
+    // Hailstorm role on main
+    "1295522487349674095": "1302372881317105684", // micros server : hailstorm role
+    "1301569908152471675": "1319067702865956957", // avalanche server : alliance ha role
   },
 };
 
@@ -70,11 +78,13 @@ client.once("ready", async () => {
 });
 
 async function safeRoleOperation(member, role, operation, actionName) {
+  Logger.role(
+    `${DRY_RUN ? "[DRY RUN] " : ""}${actionName} ${role.name} for ${
+      member.user.username
+    } in ${member.guild.name}`
+  );
   if (!DRY_RUN) {
     await retryOperation(() => member.roles[operation](role));
-    Logger.role(
-      `${actionName} ${role.name} for ${member.user.username} in ${member.guild.name}`
-    );
   }
 }
 
@@ -82,6 +92,43 @@ async function hasGuildRole(member) {
   return Object.keys(ROLE_PAIRS).some((roleId) =>
     member.roles.cache.has(roleId)
   );
+}
+
+async function removeUnauthorizedRoles(slaveGuild, mainMember, rolePairs) {
+  const slaveServerId = slaveGuild.id;
+  const slaveMember = await slaveGuild.members
+    .fetch(mainMember.id)
+    .catch(() => null);
+  if (!slaveMember) return;
+
+  // Get all roles that could be mapped to this slave server
+  const relevantRolePairs = Object.entries(rolePairs).filter(([_, servers]) =>
+    Object.keys(servers).includes(slaveServerId)
+  );
+
+  // Check each role mapping
+  for (const [mainRoleId, slaveServers] of relevantRolePairs) {
+    const slaveRoleId = slaveServers[slaveServerId];
+    if (!slaveRoleId) continue;
+
+    // If member has slave role but not main role, remove it
+    if (
+      slaveMember.roles.cache.has(slaveRoleId) &&
+      !mainMember.roles.cache.has(mainRoleId)
+    ) {
+      const role = await slaveGuild.roles.fetch(slaveRoleId);
+      if (role) {
+        Logger.role(
+          `${DRY_RUN ? "[DRY RUN] " : ""}Removed unauthorized role ${
+            role.name
+          } from ${slaveMember.user.username} in ${slaveGuild.name}`
+        );
+        if (!DRY_RUN) {
+          await retryOperation(() => slaveMember.roles.remove(role));
+        }
+      }
+    }
+  }
 }
 
 async function retryOperation(operation, maxRetries = 3) {
@@ -182,17 +229,25 @@ async function syncToSlaveServers(client, member, mainRoleId, action) {
           slaveGuild.roles.fetch(slaveRoleId),
         ]);
 
-        if (slaveMember && role && !DRY_RUN) {
+        if (slaveMember && role) {
           if (action === "add") {
-            await retryOperation(() => slaveMember.roles.add(role));
             Logger.sync(
-              `Added ${role.name} to ${member.user.username} in ${slaveGuild.name}`
+              `${DRY_RUN ? "[DRY RUN] " : ""}Added ${role.name} to ${
+                member.user.username
+              } in ${slaveGuild.name}`
             );
+            if (!DRY_RUN) {
+              await retryOperation(() => slaveMember.roles.add(role));
+            }
           } else {
-            await retryOperation(() => slaveMember.roles.remove(role));
             Logger.sync(
-              `Removed ${role.name} from ${member.user.username} in ${slaveGuild.name}`
+              `${DRY_RUN ? "[DRY RUN] " : ""}Removed ${role.name} from ${
+                member.user.username
+              } in ${slaveGuild.name}`
             );
+            if (!DRY_RUN) {
+              await retryOperation(() => slaveMember.roles.remove(role));
+            }
           }
         }
       } catch (error) {
@@ -209,6 +264,33 @@ async function syncToSlaveServers(client, member, mainRoleId, action) {
 async function initialSync(client) {
   Logger.info(`Starting initial sync (${DRY_RUN ? "DRY RUN" : "LIVE"})`);
   const mainGuild = await client.guilds.fetch(MAIN_SERVER_ID);
+
+  const slaveServerIds = new Set();
+  Object.values(ROLE_PAIRS).forEach((servers) => {
+    Object.keys(servers).forEach((serverId) => slaveServerIds.add(serverId));
+  });
+
+  // Check each slave server
+  for (const slaveServerId of slaveServerIds) {
+    try {
+      const slaveGuild = await client.guilds.fetch(slaveServerId);
+      const members = await slaveGuild.members.fetch();
+
+      // Check each member for unauthorized roles
+      for (const [_, slaveMember] of members) {
+        const mainMember = await mainGuild.members
+          .fetch(slaveMember.id)
+          .catch(() => null);
+        if (mainMember) {
+          await removeUnauthorizedRoles(slaveGuild, mainMember, ROLE_PAIRS);
+        }
+      }
+    } catch (error) {
+      Logger.error(
+        `Failed to check unauthorized roles in ${slaveServerId}: ${error}`
+      );
+    }
+  }
 
   const syncPromises = Object.entries(ROLE_PAIRS).map(
     async ([mainRoleId, slaveServers]) => {
@@ -241,15 +323,17 @@ async function initialSync(client) {
                 const slaveMember = await slaveGuild.members
                   .fetch(authorizedId)
                   .catch(() => null);
-                if (
-                  slaveMember &&
-                  !slaveMember.roles.cache.has(slaveRoleId) &&
-                  !DRY_RUN
-                ) {
-                  await retryOperation(() => slaveMember.roles.add(slaveRole));
+                if (slaveMember && !slaveMember.roles.cache.has(slaveRoleId)) {
                   Logger.sync(
-                    `Added ${slaveRole.name} to ${slaveMember.user.username}`
+                    `${DRY_RUN ? "[DRY RUN] " : ""}Added ${slaveRole.name} to ${
+                      slaveMember.user.username
+                    }`
                   );
+                  if (!DRY_RUN) {
+                    await retryOperation(() =>
+                      slaveMember.roles.add(slaveRole)
+                    );
+                  }
                 }
               }
             );
