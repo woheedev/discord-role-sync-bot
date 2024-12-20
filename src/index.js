@@ -216,7 +216,7 @@ client.once("ready", async () => {
   try {
     await setupRoleSync(client);
     //await initialSync(client);
-    await ensureClassRoleEmbed(client, "1309287447863099486");
+    await ensureClassRoleEmbed(client, "1309279173566664714"); // role selection channel
   } catch (error) {
     Logger.error(`Setup failed: ${error}`);
   }
