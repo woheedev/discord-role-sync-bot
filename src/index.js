@@ -1,4 +1,12 @@
-import { Client, GatewayIntentBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} from "discord.js";
 import * as dotenv from "dotenv";
 import chalk from "chalk";
 
@@ -28,6 +36,7 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildPresences,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ],
 });
 
@@ -67,15 +76,264 @@ const ROLE_PAIRS = {
   },
 };
 
+const CLASS_CATEGORIES = {
+  TANK: {
+    id: "Tank",
+    roles: [
+      {
+        name: "SNS / GS",
+        roleId: "1315087293408739401", // SNS / GS
+        emoji: "<:TankSNSGS:1315076330949181541>",
+      },
+      {
+        name: "SNS / WAND",
+        roleId: "1315087506105958420", // SNS / WAND
+        emoji: "<:TankSNSWand:1315076332798873672>",
+      },
+      {
+        name: "SNS / DAGGER",
+        roleId: "1315087805650571366", // SNS / DAGGER
+        emoji: "<:TankSNSDagger:1315076328793313382>",
+      },
+    ],
+  },
+  HEALER: {
+    id: "Healer",
+    roles: [
+      {
+        name: "WAND / BOW",
+        roleId: "1315090429233991812", // WAND / BOW
+        emoji: "<:HealerWandBow:1315075155122327685>",
+      },
+      {
+        name: "WAND / STAFF",
+        roleId: "1315090436703912058", // WAND / STAFF
+        emoji: "<:HealerWandStaff:1315076011464986757>",
+      },
+      {
+        name: "WAND / SNS",
+        roleId: "1315090738500993115", // WAND / SNS
+        emoji: "<:HealerWandSNS:1315076009598517391>",
+      },
+      {
+        name: "WAND / DAGGER",
+        roleId: "1315091030248263690", // WAND / DAGGER
+        emoji: "<:HealerWandDagger:1315075526746046514>",
+      },
+    ],
+  },
+  RANGED: {
+    id: "Ranged",
+    roles: [
+      {
+        name: "STAFF / BOW",
+        roleId: "1315091763370786898", // STAFF / BOW
+        emoji: "<:RangedStaffBow:1315073466290016468>",
+      },
+      {
+        name: "STAFF / DAGGER",
+        roleId: "1315091966303797248", // STAFF / DAGGER
+        emoji: "<:RangedStaffDagger:1315073831106248846>",
+      },
+      {
+        name: "BOW / DAGGER",
+        roleId: "1315092313755881573", // BOW / DAGGER
+        emoji: "<:RangedBowDagger:1315073575190925393>",
+      },
+    ],
+  },
+  MELEE: {
+    id: "Melee",
+    roles: [
+      {
+        name: "GS / DAGGER",
+        roleId: "1315092445930717194", // GS / DAGGER
+        emoji: "<:MeleeGSDagger:1315073663741071481>",
+      },
+      {
+        name: "SPEAR",
+        roleId: "1315093022483939338", // SPEAR
+        emoji: "<:Spear:1315081396888272997>",
+      },
+    ],
+  },
+  BOMBER: {
+    id: "Bomber",
+    roles: [
+      {
+        name: "DAGGER / WAND",
+        roleId: "1315092575509807215", // DAGGER / WAND
+        emoji: "<:BomberWandDagger:1315073394009440286>",
+      },
+      {
+        name: "XBOW / DAGGER",
+        roleId: "1315092852690128907", // XBOW / DAGGER
+        emoji: "<:BomberXbowDagger:1315074523137314848>",
+      },
+    ],
+  },
+};
+
+const EXTRA_ROLES = {
+  id: "Extra",
+  roles: [
+    {
+      name: "War Games",
+      roleId: "1316112180298383371",
+      emoji: "⚔️",
+    },
+    {
+      name: "PvP",
+      roleId: "1316112144600662176",
+      emoji: "❗",
+    },
+  ],
+};
+
+const ALL_WEAPON_ROLES = Object.entries(CLASS_CATEGORIES).flatMap(
+  ([categoryName, category]) =>
+    category.roles.map((role) => {
+      return {
+        label: role.name,
+        value: role.roleId,
+        emoji: role.emoji.match(/<:[^:]+:(\d+)>/)[1],
+        description: category.id,
+      };
+    })
+);
+
+const ALL_EXTRA_ROLES = EXTRA_ROLES.roles.map((role) => {
+  return {
+    label: role.name,
+    value: role.roleId,
+    emoji: role.emoji,
+    description: EXTRA_ROLES.id,
+  };
+});
+
 client.once("ready", async () => {
   Logger.info(`Bot logged in as ${client.user.tag}`);
   try {
     await setupRoleSync(client);
-    await initialSync(client);
+    //await initialSync(client);
+    await ensureClassRoleEmbed(client, "1309287447863099486");
   } catch (error) {
     Logger.error(`Setup failed: ${error}`);
   }
 });
+
+async function sendClassRoleEmbed(channel, client) {
+  const embed = new EmbedBuilder()
+    .setTitle("Class / Weapon Roles")
+    .setDescription("Select your weapon combination below:")
+    .setColor("#D11E00");
+
+  // Create select menu for all weapon roles
+  const weaponSelect = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("select_weapon")
+      .setPlaceholder("Click here to select weapons")
+      .addOptions(ALL_WEAPON_ROLES)
+  );
+
+  const message = await channel.send({
+    embeds: [embed],
+    components: [weaponSelect],
+  });
+
+  return message.id;
+}
+
+async function handleClassSelection(interaction) {
+  if (interaction.customId === "select_weapon") {
+    const selectedRole = interaction.values[0];
+    const member = interaction.member;
+
+    await removeExistingClassRoles(member);
+    await member.roles.add(selectedRole);
+
+    await interaction.reply({
+      content: "Your weapon role has been updated!",
+      ephemeral: true,
+    });
+  } else if (interaction.customId === "select_extra") {
+    const selectedRoles = interaction.values;
+    const member = interaction.member;
+
+    // Remove all extra roles first
+    for (const role of EXTRA_ROLES.roles) {
+      if (member.roles.cache.has(role.roleId)) {
+        await member.roles.remove(role.roleId);
+      }
+    }
+
+    // Add selected roles
+    for (const roleId of selectedRoles) {
+      await member.roles.add(roleId);
+    }
+
+    await interaction.reply({
+      content: "Your extra roles have been updated!",
+      ephemeral: true,
+    });
+  }
+}
+
+async function removeExistingClassRoles(member) {
+  const classRoleIds = Object.values(CLASS_CATEGORIES).flatMap((category) =>
+    category.roles.map((role) => role.roleId)
+  );
+
+  for (const roleId of classRoleIds) {
+    if (member.roles.cache.has(roleId)) {
+      await member.roles.remove(roleId);
+    }
+  }
+}
+
+async function sendExtraRolesEmbed(channel, client) {
+  const embed = new EmbedBuilder()
+    .setTitle("Extra Roles")
+    .setDescription("Select your additional roles below:")
+    .setColor("#215B01");
+
+  const extraSelect = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("select_extra")
+      .setPlaceholder("Click here to select roles")
+      .setMinValues(0)
+      .setMaxValues(ALL_EXTRA_ROLES.length)
+      .addOptions(ALL_EXTRA_ROLES)
+  );
+
+  const message = await channel.send({
+    embeds: [embed],
+    components: [extraSelect],
+  });
+
+  return message.id;
+}
+
+async function ensureClassRoleEmbed(client, channelId) {
+  const channel = await client.channels.fetch(channelId);
+  const messages = await channel.messages.fetch({ limit: 100 });
+
+  const classEmbed = messages.find(
+    (m) => m.embeds.length > 0 && m.embeds[0].title === "Class / Weapon Roles"
+  );
+
+  const extraEmbed = messages.find(
+    (m) => m.embeds.length > 0 && m.embeds[0].title === "Extra Roles"
+  );
+
+  if (!classEmbed) {
+    await sendClassRoleEmbed(channel, client);
+  }
+
+  if (!extraEmbed) {
+    await sendExtraRolesEmbed(channel, client);
+  }
+}
 
 async function safeRoleOperation(member, role, operation, actionName) {
   Logger.role(
@@ -499,5 +757,11 @@ function setupRoleSync(client) {
     }
   });
 }
+
+client.on("interactionCreate", async (interaction) => {
+  if (interaction.isStringSelectMenu()) {
+    await handleClassSelection(interaction);
+  }
+});
 
 client.login(process.env.TOKEN);
