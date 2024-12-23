@@ -4,8 +4,6 @@ import {
   EmbedBuilder,
   ActionRowBuilder,
   StringSelectMenuBuilder,
-  ButtonBuilder,
-  ButtonStyle,
 } from "discord.js";
 import * as dotenv from "dotenv";
 import chalk from "chalk";
@@ -215,7 +213,8 @@ client.once("ready", async () => {
   Logger.info(`Bot logged in as ${client.user.tag}`);
   try {
     await setupRoleSync(client);
-    //await initialSync(client);
+    await initialBanSync(client);
+    await initialSync(client);
     await ensureClassRoleEmbed(client, "1309279173566664714"); // role selection channel
   } catch (error) {
     Logger.error(`Setup failed: ${error}`);
@@ -761,6 +760,142 @@ function setupRoleSync(client) {
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isStringSelectMenu()) {
     await handleClassSelection(interaction);
+  }
+});
+
+async function initialBanSync(client) {
+  Logger.info("Starting initial ban sync");
+  const mainGuild = await client.guilds.fetch(MAIN_SERVER_ID);
+  const bans = await mainGuild.bans.fetch();
+
+  const slaveServerIds = new Set();
+  Object.values(ROLE_PAIRS).forEach((servers) => {
+    Object.keys(servers).forEach((serverId) => slaveServerIds.add(serverId));
+  });
+
+  for (const [userId, ban] of bans) {
+    for (const serverId of slaveServerIds) {
+      try {
+        const slaveGuild = await client.guilds.fetch(serverId);
+        const existingBan = await slaveGuild.bans
+          .fetch(userId)
+          .catch(() => null);
+
+        if (!existingBan) {
+          const reason = `Main server ban sync: ${
+            ban.reason || "No reason provided"
+          }`;
+          await retryOperation(() =>
+            slaveGuild.members.ban(userId, { reason })
+          );
+          Logger.info(
+            `Synced ban for ${ban.user.username} to ${slaveGuild.name}`
+          );
+        }
+      } catch (error) {
+        Logger.error(
+          `Failed to sync ban for ${userId} to ${serverId}: ${error}`
+        );
+      }
+    }
+  }
+}
+
+client.on("guildBanAdd", async (ban) => {
+  if (ban.guild.id !== MAIN_SERVER_ID) return;
+
+  Logger.info(`Ban detected for ${ban.user.username} in main server`);
+  const reason = `Main server ban sync: ${ban.reason || "No reason provided"}`;
+
+  const slaveServerIds = new Set();
+  Object.values(ROLE_PAIRS).forEach((servers) => {
+    Object.keys(servers).forEach((serverId) => slaveServerIds.add(serverId));
+  });
+
+  for (const serverId of slaveServerIds) {
+    try {
+      const slaveGuild = await client.guilds.fetch(serverId);
+      await retryOperation(() =>
+        slaveGuild.members.ban(ban.user.id, { reason })
+      );
+      Logger.info(`Banned ${ban.user.username} from ${slaveGuild.name}`);
+    } catch (error) {
+      Logger.error(
+        `Failed to ban ${ban.user.username} in ${serverId}: ${error}`
+      );
+    }
+  }
+});
+
+client.on("guildMemberRemove", async (member) => {
+  if (member.guild.id !== MAIN_SERVER_ID) return;
+
+  const auditLogs = await member.guild
+    .fetchAuditLogs({
+      type: "MEMBER_KICK",
+      limit: 1,
+    })
+    .catch(() => null);
+
+  const kickLog = auditLogs?.entries.first();
+  if (
+    !kickLog ||
+    kickLog.target?.id !== member.id ||
+    kickLog.action !== "MEMBER_KICK"
+  )
+    return;
+
+  Logger.info(`Kick detected for ${member.user.username} in main server`);
+  const reason = `Main server kick sync: ${
+    kickLog.reason || "No reason provided"
+  }`;
+
+  const slaveServerIds = new Set();
+  Object.values(ROLE_PAIRS).forEach((servers) => {
+    Object.keys(servers).forEach((serverId) => slaveServerIds.add(serverId));
+  });
+
+  for (const serverId of slaveServerIds) {
+    try {
+      const slaveGuild = await client.guilds.fetch(serverId);
+      const slaveMember = await slaveGuild.members
+        .fetch(member.id)
+        .catch(() => null);
+      if (slaveMember) {
+        await retryOperation(() => slaveMember.kick(reason));
+        Logger.info(`Kicked ${member.user.username} from ${slaveGuild.name}`);
+      }
+    } catch (error) {
+      Logger.error(
+        `Failed to kick ${member.user.username} in ${serverId}: ${error}`
+      );
+    }
+  }
+});
+
+client.on("guildBanRemove", async (unban) => {
+  if (unban.guild.id !== MAIN_SERVER_ID) return;
+
+  Logger.info(`Unban detected for ${unban.user.username} in main server`);
+  const reason = `Main server unban sync`;
+
+  const slaveServerIds = new Set();
+  Object.values(ROLE_PAIRS).forEach((servers) => {
+    Object.keys(servers).forEach((serverId) => slaveServerIds.add(serverId));
+  });
+
+  for (const serverId of slaveServerIds) {
+    try {
+      const slaveGuild = await client.guilds.fetch(serverId);
+      await retryOperation(() =>
+        slaveGuild.members.unban(unban.user.id, reason)
+      );
+      Logger.info(`Unbanned ${unban.user.username} from ${slaveGuild.name}`);
+    } catch (error) {
+      Logger.error(
+        `Failed to unban ${unban.user.username} in ${serverId}: ${error}`
+      );
+    }
   }
 });
 
