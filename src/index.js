@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits } from "discord.js";
+import { Client, GatewayIntentBits, MessageFlags } from "discord.js";
 import * as dotenv from "dotenv";
 import { debounce } from "lodash-es";
 
@@ -93,6 +93,11 @@ client.once("ready", async () => {
   try {
     Logger.info(`Bot logged in as ${client.user.tag}`);
 
+    client.user.setPresence({
+      activities: [{ name: "Bald" }],
+      status: "online",
+    });
+
     // Validate environment and configuration
     validateEnvironment();
     await validateServerConfig(client);
@@ -102,7 +107,9 @@ client.once("ready", async () => {
     }
 
     // Initialize bot systems
+    Logger.info("Starting bot systems initialization...");
     await setupRoleSync(client);
+    await setupBanHandlers(client, SERVER_CONFIG.MAIN_SERVER_ID, ROLE_PAIRS);
     await initialBanSync(
       client,
       SERVER_CONFIG.MAIN_SERVER_ID,
@@ -110,8 +117,9 @@ client.once("ready", async () => {
       DRY_RUN
     );
     await initialSync(client);
-    await ensureClassRoleEmbed(client, SERVER_CONFIG.ROLE_SELECTION_CHANNEL_ID);
+    //await ensureClassRoleEmbed(client, SERVER_CONFIG.ROLE_SELECTION_CHANNEL_ID); // disabled for now
     setupWeaponRoleEnforcement(client);
+    setupPeriodicRoleCheck(client);
 
     Logger.info("Bot initialization completed successfully");
   } catch (error) {
@@ -121,9 +129,9 @@ client.once("ready", async () => {
 });
 
 async function hasGuildRole(member) {
-  return Object.keys(ROLE_PAIRS).some((roleId) =>
-    member.roles.cache.has(roleId)
-  );
+  return Object.values(GUILD_ROLES)
+    .map((role) => role.id)
+    .some((roleId) => member.roles.cache.has(roleId));
 }
 
 async function removeUnauthorizedRoles(slaveGuild, mainMember, rolePairs) {
@@ -156,81 +164,6 @@ async function removeUnauthorizedRoles(slaveGuild, mainMember, rolePairs) {
   }
 }
 
-async function syncRoleAdd(client, member, mainRoleId) {
-  Logger.sync(`Starting role sync for ${member.user.username}`);
-  try {
-    // Log the role being synced
-    Logger.sync(`Syncing role ${mainRoleId} for ${member.user.username}`);
-    Logger.sync(
-      `Role pairs available: ${JSON.stringify(ROLE_PAIRS[mainRoleId])}`
-    );
-
-    await removeOtherGuildRoles(member, mainRoleId);
-
-    if (!member.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID)) {
-      await handleRoleOperation(
-        member,
-        SERVER_CONFIG.MAIN_MEMBER_ROLE_ID,
-        "add",
-        "Added main member role to",
-        DRY_RUN
-      );
-    }
-
-    await removePendingRole(client, member);
-
-    // Ensure the role sync operation is called with all necessary parameters
-    await syncRoleToSlaveServers(
-      client,
-      member,
-      mainRoleId,
-      "add",
-      ROLE_PAIRS,
-      processedOperations,
-      DRY_RUN
-    );
-
-    Logger.sync(`Completed role sync for ${member.user.username}`);
-  } catch (error) {
-    Logger.error(`Role sync failed for ${member.user.username}: ${error}`);
-    throw error;
-  }
-}
-
-async function syncRoleRemove(client, member, mainRoleId) {
-  Logger.sync(`Starting role removal for ${member.user.username}`);
-  try {
-    const hasOtherGuildRoles = Object.values(GUILD_ROLES).some(
-      (role) => member.roles.cache.has(role.id) && role.id !== mainRoleId
-    );
-
-    if (
-      !hasOtherGuildRoles &&
-      member.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID)
-    ) {
-      await handleRoleOperation(
-        member,
-        SERVER_CONFIG.MAIN_MEMBER_ROLE_ID,
-        "remove",
-        "Removed main member role from",
-        DRY_RUN
-      );
-    }
-    await syncRoleToSlaveServers(
-      client,
-      member,
-      mainRoleId,
-      "remove",
-      ROLE_PAIRS,
-      processedOperations,
-      DRY_RUN
-    );
-  } catch (error) {
-    Logger.error(`Role removal failed for ${member.user.username}: ${error}`);
-    throw error;
-  }
-}
-
 async function removeOtherGuildRoles(member, mainRoleId) {
   const otherGuildRoles = Object.values(GUILD_ROLES)
     .map((r) => r.id)
@@ -245,7 +178,15 @@ async function removeOtherGuildRoles(member, mainRoleId) {
         "Removed guild role from",
         DRY_RUN
       );
-      await syncRoleRemove(client, member, roleId);
+      await syncRoleToSlaveServers(
+        client,
+        member,
+        roleId,
+        "remove",
+        ROLE_PAIRS,
+        processedOperations,
+        DRY_RUN
+      );
     }
   }
 }
@@ -266,58 +207,187 @@ async function removePendingRole(client, member) {
 
 // Debounced member update handlers
 const debouncedMemberUpdate = debounce(async (oldMember, newMember) => {
+  // Skip if the change was made by the bot
+  if (newMember.guild.members.me?.id === newMember.guild.lastMemberUpdatedBy) {
+    Logger.info(
+      `Skipping member update for ${newMember.user.username} as it was made by the bot`
+    );
+    return;
+  }
+
   const isMainServer = newMember.guild.id === SERVER_CONFIG.MAIN_SERVER_ID;
+  if (!isMainServer) {
+    await handleSlaveServerUpdate(oldMember, newMember);
+    return;
+  }
 
-  if (isMainServer) {
-    const addedGuildRoles = newMember.roles.cache.filter(
-      (role) => !oldMember.roles.cache.has(role.id) && ROLE_PAIRS[role.id]
+  // Get guild roles before and after update
+  const oldGuildRoles = Object.values(GUILD_ROLES)
+    .map((role) => role.id)
+    .filter((roleId) => oldMember.roles.cache.has(roleId));
+
+  const newGuildRoles = Object.values(GUILD_ROLES)
+    .map((role) => role.id)
+    .filter((roleId) => newMember.roles.cache.has(roleId));
+
+  // If we have multiple guild roles after update, keep only the newest one
+  if (newGuildRoles.length > 1) {
+    // Find the newly added role (if any)
+    const addedRole = newGuildRoles.find(
+      (roleId) => !oldGuildRoles.includes(roleId)
     );
 
-    const removedGuildRoles = oldMember.roles.cache.filter(
-      (role) => !newMember.roles.cache.has(role.id) && ROLE_PAIRS[role.id]
-    );
+    // If we found a newly added role, remove all others
+    if (addedRole) {
+      Logger.info(
+        `Multiple guild roles detected for ${newMember.user.username}, keeping newest role`
+      );
+      const rolesToRemove = newGuildRoles.filter(
+        (roleId) => roleId !== addedRole
+      );
 
-    const memberRoleRemoved =
-      oldMember.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID) &&
-      !newMember.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID);
-
-    const pendingRoleAdded =
-      !oldMember.roles.cache.has(SERVER_CONFIG.PENDING_ROLE_ID) &&
-      newMember.roles.cache.has(SERVER_CONFIG.PENDING_ROLE_ID);
-
-    if (addedGuildRoles.size > 0) {
-      for (const [_, role] of addedGuildRoles) {
-        await retryOperation(() => syncRoleAdd(client, newMember, role.id));
+      for (const roleId of rolesToRemove) {
+        await handleRoleOperation(
+          newMember,
+          roleId,
+          "remove",
+          "Removed old guild role from",
+          DRY_RUN
+        );
       }
     }
+  }
 
-    if (removedGuildRoles.size > 0) {
-      for (const [_, role] of removedGuildRoles) {
-        await retryOperation(() => syncRoleRemove(client, newMember, role.id));
+  // Handle guild role changes
+  const addedGuildRoles = newMember.roles.cache.filter(
+    (role) => !oldMember.roles.cache.has(role.id) && ROLE_PAIRS[role.id]
+  );
+
+  const removedGuildRoles = oldMember.roles.cache.filter(
+    (role) => !newMember.roles.cache.has(role.id) && ROLE_PAIRS[role.id]
+  );
+
+  // Handle main member role changes
+  const mainMemberRoleAdded =
+    !oldMember.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID) &&
+    newMember.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID);
+
+  const mainMemberRoleRemoved =
+    oldMember.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID) &&
+    !newMember.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID);
+
+  // Handle pending role changes
+  const pendingRoleAdded =
+    !oldMember.roles.cache.has(SERVER_CONFIG.PENDING_ROLE_ID) &&
+    newMember.roles.cache.has(SERVER_CONFIG.PENDING_ROLE_ID);
+
+  // Process guild role additions
+  if (addedGuildRoles.size > 0) {
+    // Handle all local role changes first
+    for (const [_, role] of addedGuildRoles) {
+      // Remove other guild roles first
+      await removeOtherGuildRoles(newMember, role.id);
+
+      // Ensure main member role exists when guild role is added
+      if (!newMember.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID)) {
+        await handleRoleOperation(
+          newMember,
+          SERVER_CONFIG.MAIN_MEMBER_ROLE_ID,
+          "add",
+          "Added main member role to",
+          DRY_RUN
+        );
       }
+
+      // Remove pending role if it exists
+      await removePendingRole(client, newMember);
     }
 
-    if (memberRoleRemoved && (await hasGuildRole(newMember))) {
+    // Then sync all changes to slave servers
+    for (const [_, role] of addedGuildRoles) {
+      await retryOperation(() =>
+        syncRoleToSlaveServers(
+          client,
+          newMember,
+          role.id,
+          "add",
+          ROLE_PAIRS,
+          processedOperations,
+          DRY_RUN
+        )
+      );
+    }
+  }
+
+  // Process guild role removals
+  if (removedGuildRoles.size > 0) {
+    // Handle all local role changes first
+    const hasRemainingGuildRoles = await hasGuildRole(newMember);
+
+    // Remove main member role if no guild roles remain
+    if (
+      !hasRemainingGuildRoles &&
+      newMember.roles.cache.has(SERVER_CONFIG.MAIN_MEMBER_ROLE_ID)
+    ) {
       await handleRoleOperation(
         newMember,
         SERVER_CONFIG.MAIN_MEMBER_ROLE_ID,
-        "add",
-        "Restored main member role to",
+        "remove",
+        "Removed main member role from",
         DRY_RUN
       );
     }
 
-    if (pendingRoleAdded && (await hasGuildRole(newMember))) {
-      await handleRoleOperation(
-        newMember,
-        SERVER_CONFIG.PENDING_ROLE_ID,
-        "remove",
-        "Removed pending role from",
-        DRY_RUN
+    // Then sync all removals to slave servers
+    for (const [_, role] of removedGuildRoles) {
+      await retryOperation(() =>
+        syncRoleToSlaveServers(
+          client,
+          newMember,
+          role.id,
+          "remove",
+          ROLE_PAIRS,
+          processedOperations,
+          DRY_RUN
+        )
       );
     }
-  } else {
-    await handleSlaveServerUpdate(oldMember, newMember);
+  }
+
+  // Handle unauthorized main member role addition
+  if (mainMemberRoleAdded && !(await hasGuildRole(newMember))) {
+    Logger.warn(
+      `Unauthorized main member role addition detected for ${newMember.user.username}`
+    );
+    await handleRoleOperation(
+      newMember,
+      SERVER_CONFIG.MAIN_MEMBER_ROLE_ID,
+      "remove",
+      "Removed unauthorized main member role from",
+      DRY_RUN
+    );
+  }
+
+  // Handle unauthorized main member role removal
+  if (mainMemberRoleRemoved && (await hasGuildRole(newMember))) {
+    await handleRoleOperation(
+      newMember,
+      SERVER_CONFIG.MAIN_MEMBER_ROLE_ID,
+      "add",
+      "Restored main member role to",
+      DRY_RUN
+    );
+  }
+
+  // Handle pending role
+  if (pendingRoleAdded && (await hasGuildRole(newMember))) {
+    await handleRoleOperation(
+      newMember,
+      SERVER_CONFIG.PENDING_ROLE_ID,
+      "remove",
+      "Removed pending role from",
+      DRY_RUN
+    );
   }
 }, RETRY_CONFIG.OPERATION_TIMEOUT);
 
@@ -401,23 +471,59 @@ async function handleSlaveServerUpdate(oldMember, newMember) {
 
 // Helper function for slave server member adds
 async function handleSlaveServerMemberAdd(member) {
-  const mainGuild = await client.guilds.fetch(SERVER_CONFIG.MAIN_SERVER_ID);
-  const mainMember = await mainGuild.members.fetch(member.id).catch(() => null);
-  if (!mainMember) return;
+  try {
+    const mainGuild = await client.guilds.fetch(SERVER_CONFIG.MAIN_SERVER_ID);
+    const mainMember = await mainGuild.members
+      .fetch(member.id)
+      .catch(() => null);
+    if (!mainMember) {
+      Logger.info(`Member ${member.user.username} not found in main server`);
+      return;
+    }
 
-  for (const [mainRoleId, slaveServers] of Object.entries(ROLE_PAIRS)) {
-    const slaveRoleId = slaveServers[member.guild.id];
-    if (!slaveRoleId) continue;
+    // Get all roles that need to be added
+    const rolesToAdd = [];
+    for (const [mainRoleId, slaveServers] of Object.entries(ROLE_PAIRS)) {
+      const slaveRoleId = slaveServers[member.guild.id];
+      if (!slaveRoleId) continue;
 
-    if (mainMember.roles.cache.has(mainRoleId)) {
-      await handleRoleOperation(
-        member,
-        slaveRoleId,
-        "add",
-        "Added role to new member",
-        DRY_RUN
+      if (mainMember.roles.cache.has(mainRoleId)) {
+        rolesToAdd.push({
+          mainRoleId,
+          slaveRoleId,
+        });
+      }
+    }
+
+    // Add roles with retries
+    for (const { slaveRoleId } of rolesToAdd) {
+      try {
+        await retryOperation(() =>
+          handleRoleOperation(
+            member,
+            slaveRoleId,
+            "add",
+            "Added role to new member",
+            DRY_RUN
+          )
+        );
+      } catch (error) {
+        Logger.error(
+          `Failed to add role ${slaveRoleId} to ${member.user.username} in ${member.guild.name}: ${error}`
+        );
+        // Continue with other roles even if one fails
+      }
+    }
+
+    if (rolesToAdd.length > 0) {
+      Logger.info(
+        `Added ${rolesToAdd.length} roles to ${member.user.username} in ${member.guild.name}`
       );
     }
+  } catch (error) {
+    Logger.error(
+      `Failed to handle member add for ${member.user.username} in slave server: ${error}`
+    );
   }
 }
 
@@ -449,6 +555,14 @@ async function initialSync(client) {
     if (!mainGuild) {
       Logger.error("Main guild not found during initial sync");
       return;
+    }
+
+    // Check and fix roles for all members
+    Logger.info("Starting role verification for all members...");
+    const mainGuildMembers = await mainGuild.members.fetch();
+
+    for (const [_, member] of mainGuildMembers) {
+      await checkAndFixRoles(member);
     }
 
     // Get all slave server IDs in one go
@@ -613,13 +727,11 @@ client.on("interactionCreate", async (interaction) => {
       .reply({
         content:
           "An error occurred while processing your selection. Please try again later.",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       })
       .catch(() => {});
   }
 });
-
-setupBanHandlers(client, SERVER_CONFIG.MAIN_SERVER_ID);
 
 // Set up error handling for unhandled rejections
 process.on("unhandledRejection", (error) => {
@@ -636,3 +748,87 @@ client.login(process.env.TOKEN).catch((error) => {
   Logger.error(`Failed to login: ${error}`);
   process.exit(1);
 });
+
+// Add this new function for periodic role checks
+async function checkAndFixRoles(member) {
+  try {
+    // Get current guild roles
+    const currentGuildRoles = Object.values(GUILD_ROLES)
+      .map((role) => role.id)
+      .filter((roleId) => member.roles.cache.has(roleId));
+
+    // Just log if multiple guild roles found during routine check
+    // NO LONGER NEEDED
+    /*
+    if (currentGuildRoles.length > 1) {
+      const roleNames = currentGuildRoles
+        .map(
+          (roleId) =>
+            GUILD_ROLES[
+              Object.keys(GUILD_ROLES).find(
+                (key) => GUILD_ROLES[key].id === roleId
+              )
+            ]?.name || roleId
+        )
+        .join(", ");
+      Logger.warn(
+        `Member ${member.user.username} has multiple guild roles: ${roleNames}`
+      );
+    }
+    */
+
+    // Handle main member role sync
+    const hasGuildRole = currentGuildRoles.length > 0;
+    const hasMainRole = member.roles.cache.has(
+      SERVER_CONFIG.MAIN_MEMBER_ROLE_ID
+    );
+
+    if (hasGuildRole && !hasMainRole) {
+      // Add main member role if they have a guild role but no main role
+      await handleRoleOperation(
+        member,
+        SERVER_CONFIG.MAIN_MEMBER_ROLE_ID,
+        "add",
+        "Added missing main member role to",
+        DRY_RUN
+      );
+    } else if (!hasGuildRole && hasMainRole) {
+      // Remove main member role if they have no guild role
+      await handleRoleOperation(
+        member,
+        SERVER_CONFIG.MAIN_MEMBER_ROLE_ID,
+        "remove",
+        "Removed unauthorized main member role from",
+        DRY_RUN
+      );
+    }
+  } catch (error) {
+    Logger.error(
+      `Failed to check and fix roles for ${member.user.username}: ${error}`
+    );
+  }
+}
+
+// Add periodic role check (every hour)
+function setupPeriodicRoleCheck(client) {
+  setInterval(async () => {
+    try {
+      Logger.info("Starting periodic full sync");
+
+      // First do ban sync
+      await initialBanSync(
+        client,
+        SERVER_CONFIG.MAIN_SERVER_ID,
+        ROLE_PAIRS,
+        DRY_RUN
+      );
+
+      // Then do full role sync
+      await initialSync(client);
+
+      Logger.info("Periodic full sync completed");
+    } catch (error) {
+      Logger.error(`Periodic sync failed: ${error}`);
+    }
+  }, 3600000); // Run every hour
+}

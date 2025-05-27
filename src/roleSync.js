@@ -10,10 +10,16 @@ function canPerformOperation(key, timeout = RETRY_CONFIG.OPERATION_TIMEOUT) {
   return !lastOperation || Date.now() - lastOperation >= timeout;
 }
 
-export function getSlaveServerIds(ROLE_PAIRS) {
+export function getSlaveServerIds(ROLE_PAIRS, excludeFromBanSync = false) {
   const slaveServerIds = new Set();
   Object.values(ROLE_PAIRS).forEach((servers) => {
-    Object.keys(servers).forEach((serverId) => slaveServerIds.add(serverId));
+    Object.keys(servers).forEach((serverId) => {
+      // Skip the specified server if we're getting servers for ban sync
+      if (excludeFromBanSync && serverId === "1301569908152471675") {
+        return;
+      }
+      slaveServerIds.add(serverId);
+    });
   });
   return slaveServerIds;
 }
@@ -25,7 +31,7 @@ export async function handleMemberOperation(client, userId, operation, reason) {
     return;
   }
 
-  const slaveServerIds = getSlaveServerIds();
+  const slaveServerIds = getSlaveServerIds(ROLE_PAIRS);
   const promises = Array.from(slaveServerIds).map(async (serverId) => {
     try {
       const slaveGuild = await client.guilds.fetch(serverId);
@@ -223,7 +229,7 @@ export async function initialBanSync(
   const mainGuild = await client.guilds.fetch(MAIN_SERVER_ID);
   const bans = await mainGuild.bans.fetch();
 
-  const slaveServerIds = getSlaveServerIds(ROLE_PAIRS);
+  const slaveServerIds = getSlaveServerIds(ROLE_PAIRS, true);
 
   for (const [userId, ban] of bans) {
     for (const serverId of slaveServerIds) {
@@ -253,8 +259,8 @@ export async function initialBanSync(
   }
 }
 
-// Debounced ban operations
-const debouncedBanOperation = debounce(async (guild, userId, reason) => {
+// Remove debounced operations since they're causing issues
+async function banMember(guild, userId, reason) {
   try {
     await retryOperation(() => guild.members.ban(userId, { reason }));
     Logger.info(`Banned ${userId} in ${guild.name}`);
@@ -262,9 +268,9 @@ const debouncedBanOperation = debounce(async (guild, userId, reason) => {
     Logger.error(`Failed to ban ${userId} in ${guild.name}: ${error}`);
     throw error;
   }
-}, RETRY_CONFIG.OPERATION_TIMEOUT);
+}
 
-const debouncedUnbanOperation = debounce(async (guild, userId, reason) => {
+async function unbanMember(guild, userId, reason) {
   try {
     await retryOperation(() => guild.members.unban(userId, reason));
     Logger.info(`Unbanned ${userId} in ${guild.name}`);
@@ -272,25 +278,23 @@ const debouncedUnbanOperation = debounce(async (guild, userId, reason) => {
     Logger.error(`Failed to unban ${userId} in ${guild.name}: ${error}`);
     throw error;
   }
-}, RETRY_CONFIG.OPERATION_TIMEOUT);
+}
 
-export async function setupBanHandlers(client, MAIN_SERVER_ID) {
+export async function setupBanHandlers(client, MAIN_SERVER_ID, ROLE_PAIRS) {
+  Logger.info("Setting up ban and kick handlers...");
+
   client.on("guildBanAdd", async (ban) => {
+    Logger.info("Ban event received");
     if (ban.guild.id !== MAIN_SERVER_ID) return;
 
     Logger.info(`Ban detected for ${ban.user.username} in main server`);
     const reason = `Main server ban sync: ${
       ban.reason || "No reason provided"
     }`;
+    const slaveServerIds = getSlaveServerIds(ROLE_PAIRS, true);
 
-    const operationKey = `ban-${ban.user.id}`;
-    if (!canPerformOperation(operationKey)) {
-      Logger.warn(`Ban operation for ${ban.user.id} is rate limited`);
-      return;
-    }
-
-    const slaveServerIds = getSlaveServerIds();
-    const promises = Array.from(slaveServerIds).map(async (serverId) => {
+    // Process each slave server sequentially to avoid rate limits
+    for (const serverId of slaveServerIds) {
       try {
         const slaveGuild = await client.guilds.fetch(serverId);
         const existingBan = await slaveGuild.bans
@@ -298,74 +302,127 @@ export async function setupBanHandlers(client, MAIN_SERVER_ID) {
           .catch(() => null);
 
         if (!existingBan) {
-          await debouncedBanOperation(slaveGuild, ban.user.id, reason);
+          await banMember(slaveGuild, ban.user.id, reason);
         }
       } catch (error) {
         Logger.error(`Failed to ban in ${serverId}: ${error}`);
       }
-    });
-
-    await Promise.all(promises);
+    }
   });
 
   client.on("guildBanRemove", async (unban) => {
+    Logger.info("Unban event received");
     if (unban.guild.id !== MAIN_SERVER_ID) return;
 
     Logger.info(`Unban detected for ${unban.user.username} in main server`);
     const reason = "Main server unban sync";
+    const slaveServerIds = getSlaveServerIds(ROLE_PAIRS, true);
 
-    const operationKey = `unban-${unban.user.id}`;
-    if (!canPerformOperation(operationKey)) {
-      Logger.warn(`Unban operation for ${unban.user.id} is rate limited`);
-      return;
-    }
-
-    const slaveServerIds = getSlaveServerIds();
-    const promises = Array.from(slaveServerIds).map(async (serverId) => {
+    // Process each slave server sequentially to avoid rate limits
+    for (const serverId of slaveServerIds) {
       try {
         const slaveGuild = await client.guilds.fetch(serverId);
-        await debouncedUnbanOperation(slaveGuild, unban.user.id, reason);
+        const isBanned = await slaveGuild.bans
+          .fetch(unban.user.id)
+          .catch(() => null);
+
+        if (isBanned) {
+          await unbanMember(slaveGuild, unban.user.id, reason);
+        }
       } catch (error) {
         Logger.error(`Failed to unban in ${serverId}: ${error}`);
       }
-    });
-
-    await Promise.all(promises);
+    }
   });
 
   client.on("guildMemberRemove", async (member) => {
+    Logger.info("Member remove event received");
     if (member.guild.id !== MAIN_SERVER_ID) return;
 
-    const auditLogs = await member.guild
-      .fetchAuditLogs({
-        type: "MEMBER_KICK",
-        limit: 1,
-      })
-      .catch(() => null);
+    try {
+      // Check audit logs with a smaller window but more direct approach
+      const auditLogs = await member.guild
+        .fetchAuditLogs({
+          type: 20, // MEMBER_KICK
+          limit: 1,
+        })
+        .catch(() => null);
 
-    const kickLog = auditLogs?.entries.first();
-    if (
-      !kickLog ||
-      kickLog.target?.id !== member.id ||
-      kickLog.action !== "MEMBER_KICK"
-    )
-      return;
+      const kickLog = auditLogs?.entries.first();
+      const isRecentKick =
+        kickLog &&
+        kickLog.target?.id === member.id &&
+        kickLog.createdTimestamp > Date.now() - 5000; // 5 second window
 
-    Logger.info(`Kick detected for ${member.user.username} in main server`);
-    const reason = `Main server kick sync: ${
-      kickLog.reason || "No reason provided"
-    }`;
+      if (isRecentKick) {
+        // It was a kick, sync to slave servers
+        Logger.info(`Kick detected for ${member.user.username} in main server`);
+        const reason = `Main server kick sync: ${
+          kickLog.reason || "No reason provided"
+        }`;
+        const slaveServerIds = getSlaveServerIds(ROLE_PAIRS, true);
 
-    await handleMemberOperation(
-      client,
-      member.id,
-      async (guild, userId, reason) => {
-        const guildMember = await guild.members.fetch(userId).catch(() => null);
-        if (guildMember) {
-          await guildMember.kick(reason);
+        // Process each slave server sequentially
+        for (const serverId of slaveServerIds) {
+          try {
+            const slaveGuild = await client.guilds.fetch(serverId);
+            const slaveMember = await slaveGuild.members
+              .fetch(member.id)
+              .catch(() => null);
+
+            if (slaveMember) {
+              await slaveMember.kick(reason);
+              Logger.info(
+                `Kicked ${member.user.username} from ${slaveGuild.name}`
+              );
+            }
+          } catch (error) {
+            Logger.error(`Failed to kick from ${serverId}: ${error}`);
+          }
         }
-      },
-      reason
-    );
+      } else {
+        // It was a leave or we missed the kick log, just clean up roles
+        Logger.info(
+          `Member ${member.user.username} left main server, cleaning up roles`
+        );
+        const slaveServerIds = getSlaveServerIds(ROLE_PAIRS, false);
+
+        for (const serverId of slaveServerIds) {
+          try {
+            const slaveGuild = await client.guilds.fetch(serverId);
+            const slaveMember = await slaveGuild.members
+              .fetch(member.id)
+              .catch(() => null);
+
+            if (slaveMember) {
+              // Remove all synced roles
+              const rolesToRemove = Object.values(ROLE_PAIRS)
+                .map((servers) => servers[serverId])
+                .filter(
+                  (roleId) => roleId && slaveMember.roles.cache.has(roleId)
+                );
+
+              for (const roleId of rolesToRemove) {
+                await handleRoleOperation(
+                  slaveMember,
+                  roleId,
+                  "remove",
+                  "Removed role due to main server leave from",
+                  false
+                );
+              }
+            }
+          } catch (error) {
+            Logger.error(`Failed to clean up roles in ${serverId}: ${error}`);
+          }
+        }
+      }
+    } catch (error) {
+      Logger.error(
+        `Failed to handle member remove for ${member.user.username}: ${error}`
+      );
+    }
   });
+
+  Logger.info("Ban and kick handlers setup complete");
 }

@@ -2,6 +2,7 @@ import {
   EmbedBuilder,
   ActionRowBuilder,
   StringSelectMenuBuilder,
+  MessageFlags,
 } from "discord.js";
 import { Logger } from "./utils/logger.js";
 import { retryOperation } from "./roleSync.js";
@@ -142,16 +143,6 @@ export const CLASS_CATEGORIES = {
         roleId: "1315090436703912058",
         emoji: "<:HealerWandStaff:1315076011464986757>",
       },
-      {
-        name: "WAND / SNS",
-        roleId: "1315090738500993115",
-        emoji: "<:HealerWandSNS:1315076009598517391>",
-      },
-      {
-        name: "WAND / DAGGER",
-        roleId: "1315091030248263690",
-        emoji: "<:HealerWandDagger:1315075526746046514>",
-      },
     ],
   },
   RANGED: {
@@ -188,7 +179,7 @@ export const CLASS_CATEGORIES = {
         emoji: "<:Spear:1315081396888272997>",
       },
       {
-        name: "SPEAR / OTHER",
+        name: "SPEAR / GS",
         roleId: "1315093022483939338",
         emoji: "<:Spear:1315081396888272997>",
       },
@@ -215,14 +206,28 @@ export const EXTRA_ROLES = {
   id: "Extra",
   roles: [
     {
+      name: "Community Opt-Out",
+      roleId: "1331671895925461132",
+      emoji: "🔕",
+      description: "Opt out of community channels",
+    },
+    {
+      name: "Discord Updates",
+      roleId: "1331672368069869601",
+      emoji: "🔔",
+      description: "Discord update notifications & reminders (guild only)",
+    },
+    {
+      name: "Island",
+      roleId: "1331673372127399977",
+      emoji: "🏝️",
+      description: "Island notifications (guild only)",
+    },
+    {
       name: "War Games",
       roleId: "1316112180298383371",
       emoji: "⚔️",
-    },
-    {
-      name: "PvP",
-      roleId: "1316112144600662176",
-      emoji: "❗",
+      description: "InHouse War Game notifications (guild only)",
     },
   ],
 };
@@ -233,23 +238,31 @@ validateRoleConfig();
 export const ALL_WEAPON_ROLES = Object.entries(CLASS_CATEGORIES).flatMap(
   ([categoryName, category]) =>
     category.roles.map((role) => {
+      // Safer emoji parsing
+      let emojiId;
+      try {
+        emojiId = role.emoji.match(/<:[^:]+:(\d+)>/)?.[1];
+        if (!emojiId) throw new Error(`Invalid emoji format for ${role.name}`);
+      } catch (error) {
+        Logger.error(`Failed to parse emoji for ${role.name}: ${error}`);
+        emojiId = "❓"; // Fallback emoji
+      }
+
       return {
         label: role.name,
         value: role.roleId,
-        emoji: role.emoji.match(/<:[^:]+:(\d+)>/)[1],
+        emoji: emojiId,
         description: category.id,
       };
     })
 );
 
-export const ALL_EXTRA_ROLES = EXTRA_ROLES.roles.map((role) => {
-  return {
-    label: role.name,
-    value: role.roleId,
-    emoji: role.emoji,
-    description: EXTRA_ROLES.id,
-  };
-});
+export const ALL_EXTRA_ROLES = EXTRA_ROLES.roles.map((role) => ({
+  label: role.name,
+  value: role.roleId,
+  emoji: role.emoji,
+  description: role.description,
+}));
 
 // Add at the top with other constants
 const WEAPON_ROLE_IDS = new Set(
@@ -367,26 +380,69 @@ const CATEGORY_FIELDS = Object.entries(CLASS_CATEGORIES).map(
   })
 );
 
-export async function sendClassRoleEmbed(channel) {
-  try {
-    const embed = new EmbedBuilder()
-      .setTitle("Class / Weapon Roles")
-      .setDescription("Select your weapon combination below:")
-      .setColor("#D11E00")
-      .addFields(CATEGORY_FIELDS);
+// Helper functions to create embeds and components
+function createClassRoleEmbed() {
+  return new EmbedBuilder()
+    .setTitle("Class / Weapon Roles")
+    .setDescription("Select your weapon combination below:")
+    .setColor("#D11E00")
+    .addFields(CATEGORY_FIELDS);
+}
 
-    const weaponSelect = new ActionRowBuilder().addComponents(
+function createClassRoleComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder()
         .setCustomId("select_weapon")
         .setPlaceholder("Click here to select weapons")
         .addOptions(ALL_WEAPON_ROLES)
-    );
+    ),
+  ];
+}
 
+function createExtraRolesEmbed() {
+  return new EmbedBuilder()
+    .setTitle("Extra Roles")
+    .setDescription("Select your additional roles below:")
+    .setColor("#215B01");
+}
+
+function createExtraRoleComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId("select_extra")
+        .setPlaceholder("Click here to select roles")
+        .setMinValues(0)
+        .setMaxValues(ALL_EXTRA_ROLES.length)
+        .addOptions(ALL_EXTRA_ROLES)
+    ),
+  ];
+}
+
+async function safeEdit(message, content, timeoutMs = 5000) {
+  try {
+    await Promise.race([
+      message.edit(content),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Edit operation timed out")),
+          timeoutMs
+        )
+      ),
+    ]);
+  } catch (error) {
+    Logger.error(`Failed to edit message: ${error}`);
+    throw error;
+  }
+}
+
+export async function sendClassRoleEmbed(channel) {
+  try {
     const message = await channel.send({
-      embeds: [embed],
-      components: [weaponSelect],
+      embeds: [createClassRoleEmbed()],
+      components: createClassRoleComponents(),
     });
-
     return message.id;
   } catch (error) {
     Logger.error(`Failed to send class role embed: ${error}`);
@@ -396,25 +452,10 @@ export async function sendClassRoleEmbed(channel) {
 
 export async function sendExtraRolesEmbed(channel) {
   try {
-    const embed = new EmbedBuilder()
-      .setTitle("Extra Roles")
-      .setDescription("Select your additional roles below:")
-      .setColor("#215B01");
-
-    const extraSelect = new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId("select_extra")
-        .setPlaceholder("Click here to select roles")
-        .setMinValues(0)
-        .setMaxValues(ALL_EXTRA_ROLES.length)
-        .addOptions(ALL_EXTRA_ROLES)
-    );
-
     const message = await channel.send({
-      embeds: [embed],
-      components: [extraSelect],
+      embeds: [createExtraRolesEmbed()],
+      components: createExtraRoleComponents(),
     });
-
     return message.id;
   } catch (error) {
     Logger.error(`Failed to send extra roles embed: ${error}`);
@@ -431,79 +472,37 @@ export async function ensureClassRoleEmbed(client, channelId) {
     }
 
     const messages = await channel.messages.fetch({ limit: 100 });
-    if (!messages?.size) {
-      Logger.error("Failed to fetch messages");
-      return;
+
+    // Simpler message finding
+    const classEmbed = messages.find(
+      (msg) =>
+        msg.author.id === client.user.id &&
+        msg.embeds[0]?.title === "Class / Weapon Roles"
+    );
+
+    const extraEmbed = messages.find(
+      (msg) =>
+        msg.author.id === client.user.id &&
+        msg.embeds[0]?.title === "Extra Roles"
+    );
+
+    // Update or create embeds as needed
+    if (!classEmbed) {
+      await sendClassRoleEmbed(channel);
+    } else {
+      await safeEdit(classEmbed, {
+        embeds: [createClassRoleEmbed()],
+        components: createClassRoleComponents(),
+      });
     }
 
-    // Find all relevant messages in one pass
-    const { classEmbed, extraEmbed, brokenClassEmbed, brokenExtraEmbed } =
-      messages.reduce((acc, message) => {
-        if (message.embeds.length === 0) return acc;
-
-        const embed = message.embeds[0];
-        const hasComponents =
-          message.components.length > 0 &&
-          message.components[0].components.length > 0;
-
-        if (embed.title === "Class / Weapon Roles") {
-          if (hasComponents) acc.classEmbed = message;
-          else acc.brokenClassEmbed = message;
-        } else if (embed.title === "Extra Roles") {
-          if (hasComponents) acc.extraEmbed = message;
-          else acc.brokenExtraEmbed = message;
-        }
-
-        return acc;
-      }, {});
-
-    // Handle broken embeds
-    const cleanupPromises = [];
-    if (brokenClassEmbed) {
-      cleanupPromises.push(
-        brokenClassEmbed
-          .delete()
-          .catch((error) =>
-            Logger.error(`Failed to delete broken class embed: ${error}`)
-          )
-      );
-    }
-
-    if (brokenExtraEmbed) {
-      cleanupPromises.push(
-        brokenExtraEmbed
-          .delete()
-          .catch((error) =>
-            Logger.error(`Failed to delete broken extra embed: ${error}`)
-          )
-      );
-    }
-
-    // Wait for cleanup to finish before creating new embeds
-    if (cleanupPromises.length > 0) {
-      await Promise.all(cleanupPromises);
-    }
-
-    // Create new embeds if needed
-    const createPromises = [];
-    if (!classEmbed || brokenClassEmbed) {
-      createPromises.push(
-        sendClassRoleEmbed(channel).catch((error) =>
-          Logger.error(`Failed to send class role embed: ${error}`)
-        )
-      );
-    }
-
-    if (!extraEmbed || brokenExtraEmbed) {
-      createPromises.push(
-        sendExtraRolesEmbed(channel).catch((error) =>
-          Logger.error(`Failed to send extra roles embed: ${error}`)
-        )
-      );
-    }
-
-    if (createPromises.length > 0) {
-      await Promise.all(createPromises);
+    if (!extraEmbed) {
+      await sendExtraRolesEmbed(channel);
+    } else {
+      await safeEdit(extraEmbed, {
+        embeds: [createExtraRolesEmbed()],
+        components: createExtraRoleComponents(),
+      });
     }
   } catch (error) {
     Logger.error(`Failed to ensure class role embeds: ${error}`);
@@ -605,26 +604,50 @@ export function setupWeaponRoleEnforcement(client) {
   });
 }
 
+function validateRoleSelection(member, roleId, roleIds, interaction) {
+  if (!member?.roles?.cache) {
+    interaction.reply({
+      content: "Failed to process role selection: Invalid member state.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return false;
+  }
+
+  // Allow empty selections for extra roles
+  if (
+    interaction.customId === "select_extra" &&
+    (!roleId || roleId.length === 0)
+  ) {
+    return true;
+  }
+
+  if (!roleIds.has(roleId)) {
+    interaction.reply({
+      content: "Invalid role selection.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return false;
+  }
+
+  return true;
+}
+
 export async function handleClassSelection(interaction) {
   try {
     const member = interaction.member;
-    if (!member?.roles?.cache) {
-      await interaction.reply({
-        content: "Failed to process role selection: Invalid member state.",
-        ephemeral: true,
-      });
-      return;
-    }
 
     if (interaction.customId === "select_weapon") {
       const selectedRole = interaction.values[0];
 
-      // Quick validation using cached Set
-      if (!WEAPON_ROLE_IDS.has(selectedRole)) {
-        await interaction.reply({
-          content: "Invalid role selection.",
-          ephemeral: true,
-        });
+      // Use the validation helper
+      if (
+        !validateRoleSelection(
+          member,
+          selectedRole,
+          WEAPON_ROLE_IDS,
+          interaction
+        )
+      ) {
         return;
       }
 
@@ -638,7 +661,7 @@ export async function handleClassSelection(interaction) {
         await interaction.reply({
           content:
             "Failed to process role selection: Role configuration error.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -647,7 +670,7 @@ export async function handleClassSelection(interaction) {
       if (member.roles.cache.has(selectedRole)) {
         await interaction.reply({
           content: `You are already using ${roleInfo.emoji} ${roleInfo.name}!`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -660,14 +683,17 @@ export async function handleClassSelection(interaction) {
       }
 
       try {
+        await interaction.deferReply({
+          flags: [MessageFlags.Ephemeral],
+        });
+
         await removeExistingClassRoles(member);
         await debouncedRoleAdd(member, selectedRole);
 
-        await interaction.reply({
+        await interaction.editReply({
           content: `Changed your weapon role from ${
             oldRole ? `${oldRole.emoji} ${oldRole.name}` : "none"
           } to ${roleInfo.emoji} ${roleInfo.name}!`,
-          ephemeral: true,
         });
       } catch (error) {
         Logger.error(
@@ -686,12 +712,55 @@ export async function handleClassSelection(interaction) {
     } else if (interaction.customId === "select_extra") {
       const selectedRoles = interaction.values;
 
-      // Quick validation using cached Set
-      if (!selectedRoles.every((roleId) => EXTRA_ROLE_IDS.has(roleId))) {
-        await interaction.reply({
-          content: "Invalid role selection.",
-          ephemeral: true,
-        });
+      // Handle empty selection (removing all roles)
+      if (selectedRoles.length === 0) {
+        try {
+          await interaction.deferReply({
+            flags: [MessageFlags.Ephemeral],
+          });
+
+          const currentRoles = member.roles.cache;
+          const extraRoleIds = Array.from(EXTRA_ROLE_IDS);
+          const rolesToRemove = extraRoleIds.filter((roleId) =>
+            currentRoles.has(roleId)
+          );
+
+          if (rolesToRemove.length === 0) {
+            await interaction.editReply({
+              content: "You don't have any extra roles to remove!",
+            });
+            return;
+          }
+
+          // Remove roles directly
+          await Promise.all(
+            rolesToRemove.map((roleId) =>
+              member.roles.remove(roleId).catch((error) => {
+                Logger.error(
+                  `Failed to remove role ${roleId} from ${member.user.username}: ${error}`
+                );
+              })
+            )
+          );
+
+          await interaction.editReply({
+            content: "All extra roles have been removed!",
+          });
+          return;
+        } catch (error) {
+          throw error;
+        }
+      }
+
+      // Use the validation helper for extra roles
+      if (
+        !validateRoleSelection(
+          member,
+          selectedRoles[0],
+          EXTRA_ROLE_IDS,
+          interaction
+        )
+      ) {
         return;
       }
 
@@ -708,37 +777,44 @@ export async function handleClassSelection(interaction) {
       ) {
         await interaction.reply({
           content: "You already have these exact roles!",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
 
-      // Process role changes
-      const [rolesToRemove, rolesToAdd] = getRoleChanges(
-        currentRoles,
-        selectedRoles,
-        extraRoleIds
-      );
+      try {
+        await interaction.deferReply({
+          flags: [MessageFlags.Ephemeral],
+        });
 
-      // Verify roles still exist before proceeding
-      const validRolesToAdd = rolesToAdd.filter(
-        (roleId) => !currentRoles.has(roleId)
-      );
-      const validRolesToRemove = rolesToRemove.filter((roleId) =>
-        currentRoles.has(roleId)
-      );
+        // Process role changes
+        const [rolesToRemove, rolesToAdd] = getRoleChanges(
+          currentRoles,
+          selectedRoles,
+          extraRoleIds
+        );
 
-      await Promise.all([
-        ...validRolesToRemove.map((roleId) =>
-          debouncedRoleRemove(member, roleId)
-        ),
-        ...validRolesToAdd.map((roleId) => debouncedRoleAdd(member, roleId)),
-      ]);
+        // Verify roles still exist before proceeding
+        const validRolesToAdd = rolesToAdd.filter(
+          (roleId) => !currentRoles.has(roleId)
+        );
+        const validRolesToRemove = rolesToRemove.filter((roleId) =>
+          currentRoles.has(roleId)
+        );
 
-      await interaction.reply({
-        content: "Your extra roles have been updated!",
-        ephemeral: true,
-      });
+        await Promise.all([
+          ...validRolesToRemove.map((roleId) =>
+            debouncedRoleRemove(member, roleId)
+          ),
+          ...validRolesToAdd.map((roleId) => debouncedRoleAdd(member, roleId)),
+        ]);
+
+        await interaction.editReply({
+          content: "Your extra roles have been updated!",
+        });
+      } catch (error) {
+        throw error;
+      }
     }
   } catch (error) {
     Logger.error(
@@ -746,16 +822,16 @@ export async function handleClassSelection(interaction) {
         interaction.member?.user?.username || "unknown user"
       }: ${error}`
     );
-    await interaction
-      .reply({
-        content:
-          "An error occurred while updating your roles. Please try again later.",
-        ephemeral: true,
-      })
-      .catch(() => {});
+
+    // Check if we need to use reply or editReply
+    const replyMethod = interaction.deferred ? "editReply" : "reply";
+    await interaction[replyMethod]({
+      content:
+        "An error occurred while updating your roles. Please try again later.",
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {});
   }
 }
-
 // Add at the top with other constants
 const OPERATION_TIMEOUT = 30000; // 30 seconds
 
